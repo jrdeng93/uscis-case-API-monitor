@@ -14,7 +14,15 @@
     "status": "./uscis.sh status",
     "restart": "./uscis.sh restart",
     "logs": "./uscis.sh logs",
-    "follow": "./uscis.sh follow"
+    "follow": "./uscis.sh follow",
+    "launchd:install": "./uscis_launchd.sh install",
+    "launchd:start": "./uscis_launchd.sh start",
+    "launchd:stop": "./uscis_launchd.sh stop",
+    "launchd:status": "./uscis_launchd.sh status",
+    "launchd:restart": "./uscis_launchd.sh restart",
+    "launchd:logs": "./uscis_launchd.sh logs",
+    "launchd:login": "./uscis_launchd.sh login",
+    "launchd:check-all-cases": "./uscis_launchd.sh check-all-cases"
   },
   "dependencies": {
     "playwright": "^1.59.1"

@@ -1,6 +1,7 @@
 node_modules/
 state/
 snapshots/
+logs/
 *.log
 config.local.json
 .DS_Store

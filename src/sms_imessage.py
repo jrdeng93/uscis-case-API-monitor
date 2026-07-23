@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 
 @dataclass
@@ -44,6 +45,14 @@ def get_messages_db_path() -> str | None:
     return None
 
 
+def connect_messages_db(db_path: str) -> sqlite3.Connection:
+    """Open Messages DB read-only so SQLite does not need write access there."""
+    uri_path = quote(db_path)
+    conn = sqlite3.connect(f"file:{uri_path}?mode=ro", uri=True, timeout=5)
+    conn.execute("PRAGMA query_only = ON")
+    return conn
+
+
 def poll_for_code_from_messages(config: MessageConfig) -> str:
     """Poll iMessage database for OTP code from SMS containing verification keywords."""
     db_path = get_messages_db_path()
@@ -52,6 +61,8 @@ def poll_for_code_from_messages(config: MessageConfig) -> str:
             "Messages database not found. "
             "Expected: ~/Library/Messages/chat.db"
         )
+
+    print(f"[sms-test] Messages database: {db_path}", file=sys.stderr, flush=True)
 
     deadline = time.time() + config.timeout_seconds
     pattern = re.compile(config.code_regex)
@@ -75,7 +86,7 @@ def poll_for_code_from_messages(config: MessageConfig) -> str:
         )
 
         try:
-            conn = sqlite3.connect(db_path, timeout=5)
+            conn = connect_messages_db(db_path)
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
 

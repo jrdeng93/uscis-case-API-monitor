@@ -9,7 +9,10 @@ const cwd = process.cwd();
 const stateDir = path.join(cwd, "state");
 const snapshotsDir = path.join(cwd, "snapshots");
 const authFile = path.join(stateDir, "auth.json");
+const reauthRequiredFile = path.join(stateDir, "reauth-required.json");
 const lastFile = path.join(stateDir, "last.json");
+const schedulerLockFile = path.join(stateDir, "scheduler.lock");
+const discordOutboxFile = path.join(stateDir, "discord-outbox.jsonl");
 const configFile = path.join(cwd, "config.local.json");
 const exampleConfigFile = path.join(cwd, "config.example.json");
 
@@ -48,9 +51,161 @@ function ensureDirs() {
   fs.mkdirSync(snapshotsDir, { recursive: true });
 }
 
+function processIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function acquireSchedulerLock() {
+  ensureDirs();
+
+  try {
+    const existing = JSON.parse(fs.readFileSync(schedulerLockFile, "utf8"));
+    if (processIsAlive(Number(existing.pid))) {
+      throw new Error(`Another scheduler is already running (PID ${existing.pid})`);
+    }
+    fs.unlinkSync(schedulerLockFile);
+    console.warn(`Removed stale scheduler lock from PID ${existing.pid || "unknown"}`);
+  } catch (error) {
+    if (error.code !== "ENOENT" && !error.message?.includes("Unexpected")) {
+      throw error;
+    }
+    if (error.message?.includes("Unexpected")) {
+      fs.unlinkSync(schedulerLockFile);
+      console.warn("Removed invalid scheduler lock file");
+    }
+  }
+
+  const fd = fs.openSync(schedulerLockFile, "wx");
+  fs.writeFileSync(fd, JSON.stringify({
+    pid: process.pid,
+    startedAt: new Date().toISOString(),
+    startedAtEt: formatEtTimestamp(),
+  }, null, 2) + "\n", "utf8");
+  fs.closeSync(fd);
+
+  const release = () => {
+    try {
+      const current = JSON.parse(fs.readFileSync(schedulerLockFile, "utf8"));
+      if (Number(current.pid) === process.pid) {
+        fs.unlinkSync(schedulerLockFile);
+      }
+    } catch {
+      // Best-effort cleanup only.
+    }
+  };
+
+  process.once("exit", release);
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    process.once(signal, () => {
+      release();
+      process.exit(signal === "SIGINT" ? 130 : 143);
+    });
+  }
+}
+
 function loadConfig() {
   const source = fs.existsSync(configFile) ? configFile : exampleConfigFile;
   return JSON.parse(fs.readFileSync(source, "utf8"));
+}
+
+function discordWebhookUrl(config) {
+  return (
+    config?.discordWebhookUrl ||
+    process.env.USCIS_MONITOR_DISCORD_WEBHOOK_URL
+  );
+}
+
+function authMtimeMs() {
+  try {
+    return fs.statSync(authFile).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+function loadReauthRequired() {
+  try {
+    return JSON.parse(fs.readFileSync(reauthRequiredFile, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function clearReauthRequired() {
+  if (fs.existsSync(reauthRequiredFile)) {
+    fs.unlinkSync(reauthRequiredFile);
+    console.log(`✓ Cleared manual reauth state: ${reauthRequiredFile}`);
+  }
+}
+
+function activeReauthRequired() {
+  const state = loadReauthRequired();
+  if (!state) {
+    return null;
+  }
+
+  if (authMtimeMs() > Number(state.authMtimeMs || 0)) {
+    clearReauthRequired();
+    return null;
+  }
+
+  return state;
+}
+
+function markReauthRequired(reason) {
+  const now = new Date().toISOString();
+  const existing = activeReauthRequired();
+  const state = {
+    requiredAt: existing?.requiredAt || now,
+    lastNotifiedAt: existing?.lastNotifiedAt || null,
+    authMtimeMs: authMtimeMs(),
+    reason,
+  };
+  fs.writeFileSync(reauthRequiredFile, JSON.stringify(state, null, 2) + "\n", "utf8");
+  return state;
+}
+
+function reauthReminderIntervalMs(config) {
+  const hours = Number(config?.scheduler?.reauthReminderHours ?? 6);
+  if (!Number.isFinite(hours) || hours <= 0) {
+    return 6 * 60 * 60 * 1000;
+  }
+  return Math.max(hours * 60 * 60 * 1000, 60 * 60 * 1000);
+}
+
+function shouldNotifyReauthRequired(config, state) {
+  if (!state?.lastNotifiedAt) {
+    return true;
+  }
+  return Date.now() - Date.parse(state.lastNotifiedAt) >= reauthReminderIntervalMs(config);
+}
+
+async function notifyReauthRequired(config, state, message) {
+  if (!shouldNotifyReauthRequired(config, state)) {
+    console.log("Manual reauth reminder suppressed by cooldown.");
+    return;
+  }
+
+  const webhookUrl = discordWebhookUrl(config);
+  if (webhookUrl) {
+    await notifyDiscord(webhookUrl, {
+      content: `⚠️ \`${new Date().toISOString().replace("T", " ").slice(0, 19)} UTC\` ${message}`,
+    }).catch((error) => console.error(`Discord notify failed: ${error.message}`));
+  }
+
+  const updated = {
+    ...state,
+    lastNotifiedAt: new Date().toISOString(),
+  };
+  fs.writeFileSync(reauthRequiredFile, JSON.stringify(updated, null, 2) + "\n", "utf8");
 }
 
 function loginIdentifier(config) {
@@ -117,6 +272,10 @@ async function clickButton(page, regexes) {
   for (const selector of preferredSelectors) {
     const button = page.locator(selector).first();
     if (await button.count() && await button.isVisible().catch(() => false)) {
+      if (!(await button.isEnabled().catch(() => true))) {
+        console.log(`    Found disabled button: ${selector}`);
+        continue;
+      }
       console.log(`    Found button: ${selector}`);
       await button.click({ timeout: 5000 }).catch(() => {});
       return true;
@@ -127,6 +286,10 @@ async function clickButton(page, regexes) {
   for (const regex of regexes) {
     const button = page.getByRole("button", { name: regex }).first();
     if (await button.count()) {
+      if (!(await button.isEnabled().catch(() => true))) {
+        console.log(`    Found disabled button by role: ${regex}`);
+        continue;
+      }
       console.log(`    Found button by role: ${regex}`);
       await button.click({ timeout: 5000 }).catch(() => {});
       return true;
@@ -134,6 +297,10 @@ async function clickButton(page, regexes) {
     
     const input = page.locator('input[type="submit"], button').filter({ hasText: regex }).first();
     if (await input.count()) {
+      if (!(await input.isEnabled().catch(() => true))) {
+        console.log(`    Found disabled submit by text: ${regex}`);
+        continue;
+      }
       console.log(`    Found submit by text: ${regex}`);
       await input.click({ timeout: 5000 }).catch(() => {});
       return true;
@@ -234,7 +401,7 @@ function readOtp(otpConfig) {
 }
 
 // Legacy function for backward compatibility
-function readOtpFromEmail(otpConfig) {
+function readOtpFromConfiguredSource(otpConfig) {
   return readOtp(otpConfig);
 }
 
@@ -305,7 +472,7 @@ async function fillFirst(page, selectors, value) {
       `Could not find input for selectors: ${selectors.join(", ")}\nURL: ${summary.url}\nTitle: ${summary.title}\nHeading: ${summary.heading}\nAlert: ${summary.alert}\nText: ${summary.text.slice(0, 300)}`,
     );
   }
-  await input.fill(value);
+  await typeLikeHuman(input, value);
 }
 
 async function pageSummary(page) {
@@ -554,8 +721,9 @@ async function login(config) {
         console.log("No OTP input found - proceeding without OTP");
       }
     } catch (otpError) {
-      console.error(`⚠️  OTP handling error (continuing): ${otpError.message}`);
+      console.error(`⚠️  OTP handling error: ${otpError.message}`);
       await writeDebugSnapshot(page, "otp-error");
+      throw otpError;
     }
 
     console.log(`Waiting ${config.postLoginWaitMs ?? 5000}ms before navigating to monitor URL...`);
@@ -612,6 +780,7 @@ async function login(config) {
 
     await context.storageState({ path: authFile });
     console.log(`✓ Saved authenticated session to ${authFile}`);
+    clearReauthRequired();
   } finally {
     await browser.close();
   }
@@ -671,6 +840,221 @@ function deepHash(obj) {
   return sha256(JSON.stringify(obj || {}));
 }
 
+function formatEtTimestamp(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+    timeZoneName: "short",
+  }).formatToParts(date);
+  const part = (type) => parts.find((item) => item.type === type)?.value;
+  return `${part("year")}-${part("month")}-${part("day")} ${part("hour")}:${part("minute")}:${part("second")} ${part("timeZoneName") || "ET"}`;
+}
+
+function joinApiUrl(baseUrl, receiptNumber) {
+  return `${String(baseUrl || "").replace(/\/+$/, "")}/${encodeURIComponent(receiptNumber)}`;
+}
+
+function getCaseStatusApiUrl(config) {
+  return config.caseStatusApiUrl || "https://my.uscis.gov/account/case-service/api/case_status";
+}
+
+function changedTopLevelFields(prevData, currData) {
+  const keys = new Set([
+    ...Object.keys(prevData || {}),
+    ...Object.keys(currData || {}),
+  ]);
+  return [...keys]
+    .filter((key) => deepHash(prevData?.[key]) !== deepHash(currData?.[key]))
+    .sort();
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function shortValue(value) {
+  if (value === undefined) return "missing";
+  if (value === null) return "null";
+  if (typeof value === "string") return value || '""';
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) return `[${value.length} item${value.length === 1 ? "" : "s"}]`;
+  if (isPlainObject(value)) return "{...}";
+  return String(value);
+}
+
+function summarizeFieldChanges(previous, current, fields, maxFields = 8) {
+  const priority = [
+    "updatedAt",
+    "updatedAtTimestamp",
+    "eventDateTime",
+    "submissionDate",
+    "formType",
+    "formName",
+    "closed",
+    "actionRequired",
+    "areAllGroupStatusesComplete",
+    "areAllGroupMembersAuthorizedForTravel",
+    "documents",
+    "evidenceRequests",
+    "notices",
+    "events",
+  ];
+  const orderedFields = [
+    ...priority.filter((field) => fields.includes(field)),
+    ...fields.filter((field) => !priority.includes(field)),
+  ];
+
+  return orderedFields.slice(0, maxFields).map((field) => {
+    const prevValue = previous?.[field];
+    const currValue = current?.[field];
+    if (field === "events" && (Array.isArray(prevValue) || Array.isArray(currValue))) {
+      return `${field}: ${prevValue?.length || 0} → ${currValue?.length || 0}`;
+    }
+    return `${field}: ${shortValue(prevValue)} → ${shortValue(currValue)}`;
+  });
+}
+
+function summarizeEventChanges(prevEvents, currEvents) {
+  const prevById = new Map(prevEvents.map((event, index) => [event.eventId || `${event.eventCode}:${index}`, event]));
+  const currById = new Map(currEvents.map((event, index) => [event.eventId || `${event.eventCode}:${index}`, event]));
+  const newEvents = currEvents.filter((event, index) => !prevById.has(event.eventId || `${event.eventCode}:${index}`));
+  const removedEvents = prevEvents.filter((event, index) => !currById.has(event.eventId || `${event.eventCode}:${index}`));
+  const changedEvents = currEvents
+    .map((event, index) => {
+      const key = event.eventId || `${event.eventCode}:${index}`;
+      const previous = prevById.get(key);
+      if (!previous || deepHash(previous) === deepHash(event)) {
+        return null;
+      }
+      return {
+        eventId: event.eventId,
+        eventCode: event.eventCode,
+        changedFields: changedTopLevelFields(previous, event),
+        fromUpdatedAtTimestamp: previous.updatedAtTimestamp,
+        toUpdatedAtTimestamp: event.updatedAtTimestamp,
+      };
+    })
+    .filter(Boolean);
+
+  return { newEvents, removedEvents, changedEvents };
+}
+
+function getApiResponsesForDiff(caseData) {
+  if (caseData?.apiResponses) {
+    return caseData.apiResponses;
+  }
+  // Backward compatibility for history entries saved before multi-API support.
+  return caseData ? { cases: caseData } : {};
+}
+
+function isUsableApiResponse(response) {
+  return Boolean(response && typeof response === "object" && response.data);
+}
+
+function stableCaseBundle(record) {
+  const current = record?.current || null;
+  const previous = record?.previous || null;
+  if (!current && !previous) {
+    return null;
+  }
+
+  const apiResponses = {};
+  for (const apiName of ["cases", "caseStatus"]) {
+    const currentResponse = current?.apiResponses?.[apiName];
+    const previousResponse = previous?.apiResponses?.[apiName];
+    if (isUsableApiResponse(currentResponse)) {
+      apiResponses[apiName] = currentResponse;
+    } else if (isUsableApiResponse(previousResponse)) {
+      apiResponses[apiName] = previousResponse;
+    }
+  }
+
+  const data =
+    apiResponses.cases?.data ||
+    current?.data ||
+    previous?.data ||
+    apiResponses.caseStatus?.data ||
+    null;
+
+  if (!data) {
+    return null;
+  }
+
+  return {
+    data,
+    apiResponses,
+  };
+}
+
+function mergeFetchedBundle(previousBundle, fetchedBundle) {
+  const apiResponses = { ...(previousBundle?.apiResponses || {}) };
+  for (const [apiName, response] of Object.entries(fetchedBundle?.apiResponses || {})) {
+    if (isUsableApiResponse(response)) {
+      apiResponses[apiName] = response;
+    }
+  }
+
+  const data =
+    apiResponses.cases?.data ||
+    previousBundle?.data ||
+    apiResponses.caseStatus?.data ||
+    null;
+
+  return {
+    data,
+    apiResponses,
+    apiErrors: fetchedBundle?.apiErrors || {},
+  };
+}
+
+function summarizeApiResponseChange(previousResponse, currentResponse) {
+  const prevData = previousResponse?.data || null;
+  const currData = currentResponse?.data || null;
+  const dataChangedFields = changedTopLevelFields(prevData || {}, currData || {});
+  const responseChangedFields = changedTopLevelFields(previousResponse, currentResponse);
+  const summary = [];
+
+  if (!prevData && currData) {
+    summary.push("data became available");
+  } else if (prevData && !currData) {
+    summary.push("data became unavailable");
+  }
+
+  if (dataChangedFields.length > 0) {
+    summary.push(...summarizeFieldChanges(prevData || {}, currData || {}, dataChangedFields));
+  } else if (responseChangedFields.length > 0) {
+    summary.push(`response envelope changed: ${responseChangedFields.join(", ")}`);
+  }
+
+  const eventChanges =
+    Array.isArray(prevData?.events) && Array.isArray(currData?.events)
+      ? summarizeEventChanges(prevData.events, currData.events)
+      : null;
+
+  if (eventChanges?.newEvents?.length) {
+    summary.push(`new events: ${eventChanges.newEvents.length}`);
+  }
+  if (eventChanges?.changedEvents?.length) {
+    summary.push(
+      `changed events: ${eventChanges.changedEvents
+        .map((event) => `${event.eventCode || "event"} ${event.changedFields.join(", ")}`)
+        .join("; ")}`,
+    );
+  }
+
+  return {
+    responseChangedFields,
+    dataChangedFields,
+    summary,
+  };
+}
+
 function detectChanges(previousData, currentData) {
   const changes = {};
   
@@ -688,15 +1072,25 @@ function detectChanges(previousData, currentData) {
       to: currData.updatedAt,
     };
   }
+
+  if (prevData.updatedAtTimestamp !== currData.updatedAtTimestamp) {
+    changes.updatedAtTimestamp = {
+      from: prevData.updatedAtTimestamp,
+      to: currData.updatedAtTimestamp,
+    };
+  }
   
   // Check events
-  const prevEventCount = (prevData.events || []).length;
-  const currEventCount = (currData.events || []).length;
-  if (prevEventCount !== currEventCount) {
+  const prevEvents = prevData.events || [];
+  const currEvents = currData.events || [];
+  const prevEventCount = prevEvents.length;
+  const currEventCount = currEvents.length;
+  if (prevEventCount !== currEventCount || deepHash(prevEvents) !== deepHash(currEvents)) {
+    const eventChanges = summarizeEventChanges(prevEvents, currEvents);
     changes.events = {
       from: prevEventCount,
       to: currEventCount,
-      newEvents: (currData.events || []).slice(prevEventCount),
+      ...eventChanges,
     };
   }
   
@@ -714,6 +1108,47 @@ function detectChanges(previousData, currentData) {
       from: prevData.actionRequired,
       to: currData.actionRequired,
     };
+  }
+
+  const previousHash = deepHash(prevData);
+  const currentHash = deepHash(currData);
+  if (previousHash !== currentHash) {
+    const changedFields = changedTopLevelFields(prevData, currData);
+    changes.caseData = {
+      fromHash: previousHash,
+      toHash: currentHash,
+      changedFields,
+      summary: summarizeFieldChanges(prevData, currData, changedFields),
+    };
+  }
+
+  const prevApiResponses = getApiResponsesForDiff(previousData);
+  const currApiResponses = getApiResponsesForDiff(currentData);
+  const apiNames = new Set([
+    ...Object.keys(prevApiResponses),
+    ...Object.keys(currApiResponses),
+  ]);
+  const apiResponseChanges = {};
+
+  for (const apiName of apiNames) {
+    const previousResponse = prevApiResponses[apiName] || null;
+    const currentResponse = currApiResponses[apiName] || null;
+    const fromHash = deepHash(previousResponse);
+    const toHash = deepHash(currentResponse);
+    if (fromHash !== toHash) {
+      const apiSummary = summarizeApiResponseChange(previousResponse, currentResponse);
+      apiResponseChanges[apiName] = {
+        fromHash,
+        toHash,
+        changedFields: apiSummary.responseChangedFields,
+        dataChangedFields: apiSummary.dataChangedFields,
+        summary: apiSummary.summary,
+      };
+    }
+  }
+
+  if (Object.keys(apiResponseChanges).length > 0) {
+    changes.apiResponses = apiResponseChanges;
   }
   
   const isChanged = Object.keys(changes).length > 0;
@@ -737,8 +1172,8 @@ async function getCookies(config) {
   return cookies.map(c => `${c.name}=${c.value}`).join("; ");
 }
 
-async function fetchSingleCase(receiptNumber, config) {
-  const apiUrl = `${config.apiUrl}/${receiptNumber}`;
+async function fetchApiJson(baseUrl, receiptNumber, config, apiName) {
+  const apiUrl = joinApiUrl(baseUrl, receiptNumber);
   const cookieHeader = await getCookies(config);
   
   try {
@@ -754,8 +1189,9 @@ async function fetchSingleCase(receiptNumber, config) {
         },
       });
     } catch (networkErr) {
-      const err = new Error(`Network error: ${networkErr.message}`);
+      const err = new Error(`Network error from ${apiName}: ${networkErr.message}`);
       err.code = "NETWORK_ERROR";
+      err.apiName = apiName;
       throw err;
     }
     
@@ -764,11 +1200,16 @@ async function fetchSingleCase(receiptNumber, config) {
       const error = new Error("SESSION_EXPIRED");
       error.code = "SESSION_EXPIRED";
       error.statusCode = 401;
+      error.apiName = apiName;
       throw error;
     }
     
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      const error = new Error(`${apiName} HTTP ${response.status}: ${response.statusText}`);
+      error.code = "API_FETCH_ERROR";
+      error.statusCode = response.status;
+      error.apiName = apiName;
+      throw error;
     }
     
     const data = await response.json();
@@ -778,18 +1219,75 @@ async function fetchSingleCase(receiptNumber, config) {
       const error = new Error("SESSION_EXPIRED");
       error.code = "SESSION_EXPIRED";
       error.apiError = data.error;
+      error.apiName = apiName;
       throw error;
     }
     
     return data;
   } catch (error) {
-    // Don't suppress SESSION_EXPIRED or NETWORK_ERROR - let them propagate with code
-    if (error.code === "SESSION_EXPIRED" || error.code === "NETWORK_ERROR") {
+    // Don't suppress structured API errors. The bundle layer decides whether they are fatal.
+    if (error.code === "SESSION_EXPIRED" || error.code === "NETWORK_ERROR" || error.code === "API_FETCH_ERROR") {
       throw error;
     }
-    console.error(`❌ Error fetching ${receiptNumber}: ${error.message}`);
-    return null;
+    const structured = new Error(error.message);
+    structured.code = "API_FETCH_ERROR";
+    structured.apiName = apiName;
+    throw structured;
   }
+}
+
+async function fetchSingleCase(receiptNumber, config) {
+  return fetchApiJson(config.apiUrl, receiptNumber, config, "cases");
+}
+
+async function fetchSingleCaseStatus(receiptNumber, config) {
+  return fetchApiJson(getCaseStatusApiUrl(config), receiptNumber, config, "case_status");
+}
+
+async function fetchCaseBundle(receiptNumber, config) {
+  const entries = await Promise.allSettled([
+    fetchSingleCase(receiptNumber, config).then((data) => ["cases", data]),
+    fetchSingleCaseStatus(receiptNumber, config).then((data) => ["caseStatus", data]),
+  ]);
+
+  const apiResponses = {};
+  const apiErrors = {};
+  const fatalErrors = [];
+
+  for (const entry of entries) {
+    if (entry.status === "fulfilled") {
+      const [apiName, data] = entry.value;
+      apiResponses[apiName] = data;
+      continue;
+    }
+
+    const error = entry.reason;
+    const apiName = error.apiName || "unknown";
+    apiErrors[apiName] = error.message;
+    if (error.code === "SESSION_EXPIRED") {
+      fatalErrors.push(error);
+    }
+    console.error(`❌ Error fetching ${receiptNumber} via ${apiName}: ${error.message}`);
+  }
+
+  if (fatalErrors.length > 0) {
+    throw fatalErrors[0];
+  }
+
+  if (!apiResponses.cases && !apiResponses.caseStatus) {
+    const firstErrorMessage = Object.values(apiErrors)[0] || "Invalid API response";
+    const error = new Error(firstErrorMessage);
+    error.code = Object.keys(apiErrors).some((apiName) => apiErrors[apiName].includes("Network error"))
+      ? "NETWORK_ERROR"
+      : "API_FETCH_ERROR";
+    throw error;
+  }
+
+  return {
+    data: apiResponses.cases?.data || apiResponses.caseStatus?.data || null,
+    apiResponses,
+    apiErrors,
+  };
 }
 
 async function sendDiscordWebhook(webhookUrl, payload, { retries = 2, delayMs = 3000 } = {}) {
@@ -815,6 +1313,102 @@ async function sendDiscordWebhook(webhookUrl, payload, { retries = 2, delayMs = 
   throw lastError;
 }
 
+function enqueueDiscordWebhook(payload, error) {
+  ensureDirs();
+  const entry = {
+    queuedAt: new Date().toISOString(),
+    queuedAtEt: formatEtTimestamp(),
+    lastError: error?.message || String(error || "unknown error"),
+    payload,
+  };
+  fs.appendFileSync(discordOutboxFile, JSON.stringify(entry) + "\n", "utf8");
+  console.error(`Discord notify queued for retry: ${entry.lastError}`);
+}
+
+function readDiscordOutbox() {
+  if (!fs.existsSync(discordOutboxFile)) {
+    return [];
+  }
+
+  return fs.readFileSync(discordOutboxFile, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+function writeDiscordOutbox(entries) {
+  if (!entries.length) {
+    if (fs.existsSync(discordOutboxFile)) {
+      fs.unlinkSync(discordOutboxFile);
+    }
+    return;
+  }
+
+  fs.writeFileSync(
+    discordOutboxFile,
+    entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+    "utf8",
+  );
+}
+
+async function flushDiscordOutbox(webhookUrl, { maxMessages = 20 } = {}) {
+  const entries = readDiscordOutbox();
+  if (!entries.length) {
+    return;
+  }
+
+  const remaining = [];
+  let sent = 0;
+  for (const entry of entries) {
+    if (sent >= maxMessages) {
+      remaining.push(entry);
+      continue;
+    }
+
+    try {
+      await sendDiscordWebhook(webhookUrl, entry.payload);
+      sent += 1;
+    } catch (error) {
+      remaining.push({
+        ...entry,
+        lastError: error.message,
+        lastAttemptAt: new Date().toISOString(),
+        lastAttemptAtEt: formatEtTimestamp(),
+      });
+      remaining.push(...entries.slice(entries.indexOf(entry) + 1));
+      writeDiscordOutbox(remaining);
+      console.error(`Discord outbox flush stopped: ${error.message}`);
+      return;
+    }
+  }
+
+  writeDiscordOutbox(remaining);
+  if (sent > 0) {
+    console.log(`✓ Flushed ${sent} queued Discord notification(s)`);
+  }
+}
+
+async function notifyDiscord(webhookUrl, payload) {
+  await flushDiscordOutbox(webhookUrl).catch((error) => {
+    console.error(`Discord outbox flush failed: ${error.message}`);
+  });
+
+  try {
+    await sendDiscordWebhook(webhookUrl, payload);
+    return true;
+  } catch (error) {
+    enqueueDiscordWebhook(payload, error);
+    return false;
+  }
+}
+
 function buildDiscordEmbed(receiptNumber, caseData, changes) {
   const data = caseData.data || {};
   const changedFields = Object.entries(changes || {});
@@ -831,6 +1425,41 @@ function buildDiscordEmbed(receiptNumber, caseData, changes) {
         fields.push({
           name: `New Event`,
           value: `**${evt.actionCodeText || "Unknown"}**\n${evt.dispositionCodeText || ""}\n${evt.eventDate || ""}`,
+        });
+      }
+      if (detail.changedEvents?.length) {
+        fields.push({
+          name: "Changed Events",
+          value: detail.changedEvents
+            .map((evt) => `${evt.eventCode || "event"} ${evt.eventId || ""}: ${evt.changedFields.join(", ")}`)
+            .join("\n")
+            .slice(0, 1024),
+        });
+      }
+    } else if (key === "events" && detail.changedEvents?.length) {
+      fields.push({
+        name: "Changed Events",
+        value: detail.changedEvents
+          .map((evt) => `${evt.eventCode || "event"} ${evt.eventId || ""}: ${evt.changedFields.join(", ")}`)
+          .join("\n")
+          .slice(0, 1024),
+      });
+    } else if (key === "caseData") {
+      fields.push({
+        name: "Case Data Changed",
+        value: [
+          `Fields: ${(detail.changedFields || []).join(", ") || "unknown"}`,
+          ...(detail.summary || []),
+        ].join("\n").slice(0, 1024),
+      });
+    } else if (key === "apiResponses") {
+      for (const [apiName, apiChange] of Object.entries(detail)) {
+        const summaryLines = apiChange.summary?.length
+          ? apiChange.summary
+          : [`changed fields: ${(apiChange.changedFields || []).join(", ") || "unknown"}`];
+        fields.push({
+          name: `${apiName} API Changed`,
+          value: summaryLines.join("\n").slice(0, 1024),
         });
       }
     } else {
@@ -858,21 +1487,25 @@ async function triggerNotification(receiptNumber, caseData, changes, config) {
     console.log(`\n🔔 [NOTIFICATION] Case ${receiptNumber} updated:`);
     console.log(`  Changes: ${JSON.stringify(changes)}`);
     
-    const webhookUrl = config?.discordWebhookUrl || process.env.PHONEMONITOR_DISCORD_WEBHOOK_URL;
+    const webhookUrl = discordWebhookUrl(config);
     if (!webhookUrl) {
-      console.log("  ⚠️ No Discord webhook URL configured (set discordWebhookUrl in config or PHONEMONITOR_DISCORD_WEBHOOK_URL env var)");
+      console.log("  ⚠️ No Discord webhook URL configured (set discordWebhookUrl in config or USCIS_MONITOR_DISCORD_WEBHOOK_URL env var)");
       return;
     }
     
     const payload = buildDiscordEmbed(receiptNumber, caseData, changes);
-    await sendDiscordWebhook(webhookUrl, payload);
-    console.log("  ✓ Discord notification sent");
+    const sent = await notifyDiscord(webhookUrl, payload);
+    console.log(sent ? "  ✓ Discord notification sent" : "  ⚠️ Discord notification queued for retry");
   } catch (error) {
     console.error(`  ✗ Discord notification failed: ${error.message}`);
   }
 }
 
-async function checkAllCases(config) {
+async function checkAllCases(config, options = {}) {
+  const notifyNoChange = options.notifyNoChange ?? true;
+  const notifyErrors = options.notifyErrors ?? true;
+  const autoReauth = options.autoReauth ?? true;
+  const startedAtDate = new Date();
   requireAuthState();
   
   const receiptNumbers = config.receiptNumbers || (config.receiptNumber ? [config.receiptNumber] : []);
@@ -882,7 +1515,7 @@ async function checkAllCases(config) {
   
   let sessionExpired = false;
   let retryCount = 0;
-  const maxRetries = 1;
+  const maxRetries = autoReauth ? 1 : 0;
   
   while (retryCount <= maxRetries) {
     try {
@@ -894,7 +1527,10 @@ async function checkAllCases(config) {
       for (const receiptNumber of receiptNumbers) {
         try {
           console.log(`⏳ Fetching ${receiptNumber}...`);
-          const caseData = await fetchSingleCase(receiptNumber, config);
+          const fetchedCaseData = await fetchCaseBundle(receiptNumber, config);
+          const previousRecord = history[receiptNumber];
+          const previousForDiff = stableCaseBundle(previousRecord);
+          const caseData = mergeFetchedBundle(previousForDiff, fetchedCaseData);
           
           if (!caseData || !caseData.data) {
             console.log(`⚠️  Could not fetch ${receiptNumber} (invalid response), skipping...\n`);
@@ -910,16 +1546,18 @@ async function checkAllCases(config) {
 
           
           // Detect changes
-          const previousRecord = history[receiptNumber];
-          const { isChanged, changes } = detectChanges(previousRecord?.current, caseData);
+          const { isChanged, changes } = detectChanges(previousForDiff, caseData);
+          const apiErrors = fetchedCaseData.apiErrors || {};
+          const apiErrorEntries = Object.entries(apiErrors);
           
           // Update history
           history[receiptNumber] = {
             lastFetchAt: new Date().toISOString(),
             lastHash: deepHash(caseData),
             current: caseData,
-            previous: previousRecord?.current || null,
+            previous: previousForDiff || previousRecord?.current || null,
             changes: isChanged ? changes : null,
+            lastApiErrors: apiErrorEntries.length > 0 ? apiErrors : null,
           };
           
           // Print summary
@@ -929,6 +1567,10 @@ async function checkAllCases(config) {
           console.log(`  Name: ${data.applicantName || "N/A"}`);
           console.log(`  Updated: ${data.updatedAt || "N/A"}`);
           console.log(`  Events: ${(data.events || []).length}`);
+          console.log(`  APIs: cases=${fetchedCaseData.apiResponses?.cases ? "ok" : (apiErrors.cases ? "failed" : "missing")}, case_status=${fetchedCaseData.apiResponses?.caseStatus ? "ok" : (apiErrors.caseStatus ? "failed" : "missing")}`);
+          if (apiErrorEntries.length > 0) {
+            console.log(`  API warnings: ${apiErrorEntries.map(([apiName, message]) => `${apiName}: ${message}`).join("; ")}`);
+          }
           console.log(`  Status: ${isChanged ? "🔄 CHANGED" : "✓ No changes"}`);
           
           if (isChanged) {
@@ -945,6 +1587,11 @@ async function checkAllCases(config) {
             isChanged,
             formName: data.formName || null,
             updatedAt: data.updatedAt || null,
+            apiGroups: {
+              cases: Boolean(fetchedCaseData.apiResponses?.cases),
+              caseStatus: Boolean(fetchedCaseData.apiResponses?.caseStatus),
+            },
+            apiErrors: apiErrorEntries.length > 0 ? apiErrors : undefined,
           });
         } catch (error) {
           // Check if it's a session expired error
@@ -974,8 +1621,12 @@ async function checkAllCases(config) {
       console.log(`✓ History saved to ${caseHistoryFile}\n`);
       
       // Return summary
+      const checkedAtDate = new Date();
       const summary = {
-        checkedAt: new Date().toISOString(),
+        startedAt: startedAtDate.toISOString(),
+        startedAtEt: formatEtTimestamp(startedAtDate),
+        checkedAt: checkedAtDate.toISOString(),
+        checkedAtEt: formatEtTimestamp(checkedAtDate),
         totalCases: receiptNumbers.length,
         changedCases: results.filter(r => r.isChanged && !r.error).length,
         results,
@@ -985,29 +1636,43 @@ async function checkAllCases(config) {
       console.log(JSON.stringify(summary, null, 2));
       
       // Send Discord summary
-      const webhookUrl = config?.discordWebhookUrl || process.env.PHONEMONITOR_DISCORD_WEBHOOK_URL;
+      const webhookUrl = discordWebhookUrl(config);
       if (webhookUrl) {
-        const ts = new Date().toISOString().replace("T", " ").slice(0, 19) + " UTC";
+        const tsUtc = checkedAtDate.toISOString().replace("T", " ").slice(0, 19) + " UTC";
+        const tsEt = formatEtTimestamp(checkedAtDate);
         const errorResults = summary.results.filter(r => r.error);
         const successResults = summary.results.filter(r => !r.error);
+        const warningResults = summary.results.filter(r => r.apiErrors && Object.keys(r.apiErrors).length > 0);
 
-        if (errorResults.length === summary.totalCases) {
+        if (notifyErrors && errorResults.length === summary.totalCases) {
           // All cases failed — send error alert
           const firstError = errorResults[0]?.error || "Unknown error";
-          await sendDiscordWebhook(webhookUrl, {
-            content: `⚠️ \`${ts}\` All ${summary.totalCases} case checks failed — \`${firstError}\`. Will retry next cycle.`,
+          await notifyDiscord(webhookUrl, {
+            content: `⚠️ \`${tsEt}\` (${tsUtc}) All ${summary.totalCases} case checks failed — \`${firstError}\`. Will retry next cycle.`,
           }).catch((e) => console.error(`Discord notify failed: ${e.message}`));
-        } else if (errorResults.length > 0) {
+        } else if (notifyErrors && errorResults.length > 0) {
           // Partial failure
           const failed = errorResults.map(r => r.receiptNumber).join(", ");
-          await sendDiscordWebhook(webhookUrl, {
-            content: `⚠️ \`${ts}\` Checked ${summary.totalCases} cases — ${successResults.length} OK, ${errorResults.length} failed (${failed}). Will retry next cycle.`,
+          await notifyDiscord(webhookUrl, {
+            content: `⚠️ \`${tsEt}\` (${tsUtc}) Checked ${summary.totalCases} cases — ${successResults.length} OK, ${errorResults.length} failed (${failed}). Will retry next cycle.`,
+          }).catch((e) => console.error(`Discord notify failed: ${e.message}`));
+        } else if (notifyErrors && warningResults.length > 0 && summary.changedCases === 0) {
+          const warningSummary = warningResults
+            .map((result) => {
+              const apiNames = Object.keys(result.apiErrors || {}).join(", ");
+              return `${result.receiptNumber}: ${apiNames}`;
+            })
+            .join("; ");
+          await notifyDiscord(webhookUrl, {
+            content: `⚠️ \`${tsEt}\` (${tsUtc}) Checked ${summary.totalCases} cases — data stable, but auxiliary API warning(s): ${warningSummary}. Previous successful values were preserved.`,
+          }).catch((e) => console.error(`Discord notify failed: ${e.message}`));
+        } else if (summary.changedCases === 0 && notifyNoChange) {
+          // All success, no changes
+          await notifyDiscord(webhookUrl, {
+            content: `\`${tsEt}\` (${tsUtc}) ✓ Checked ${summary.totalCases} cases — no changes found.`,
           }).catch((e) => console.error(`Discord notify failed: ${e.message}`));
         } else if (summary.changedCases === 0) {
-          // All success, no changes
-          await sendDiscordWebhook(webhookUrl, {
-            content: `\`${ts}\` ✓ Checked ${summary.totalCases} cases — no changes found.`,
-          }).catch((e) => console.error(`Discord notify failed: ${e.message}`));
+          console.log("Discord no-change summary suppressed for this scheduled keepalive.");
         }
         // If changedCases > 0, individual notifications already sent via triggerNotification()
       }
@@ -1043,7 +1708,7 @@ async function fetchCaseJson(config) {
   }
   
   const receiptNumber = receiptNumbers[0];
-  const caseData = await fetchSingleCase(receiptNumber, config);
+  const caseData = await fetchCaseBundle(receiptNumber, config);
   
   if (!caseData) {
     throw new Error(`Failed to fetch case ${receiptNumber}`);
@@ -1097,94 +1762,135 @@ async function poll(config) {
 
 // --- Scheduler ---
 
-function isWithinSchedule() {
-  // Check if current time is within ET weekday 9am-8pm
+const SCHEDULE_START_HOUR_ET = 9;
+const SCHEDULE_END_HOUR_ET = 21;
+const DEFAULT_SCHEDULER_INTERVAL_HOURS = 3;
+
+function getEtDate() {
   const now = new Date();
   const etStr = now.toLocaleString("en-US", { timeZone: "America/New_York" });
-  const et = new Date(etStr);
-  const day = et.getDay(); // 0=Sun, 6=Sat
-  const hour = et.getHours();
-  if (day === 0 || day === 6) return false;
-  return hour >= 9 && hour < 20;
+  return new Date(etStr);
+}
+
+function isWithinScheduleWindow() {
+  // Run daily from 9:00am ET through the final 9:00pm ET slot.
+  const et = getEtDate();
+  const minutesSinceDayStart = et.getHours() * 60 + et.getMinutes();
+  return (
+    minutesSinceDayStart >= SCHEDULE_START_HOUR_ET * 60 &&
+    minutesSinceDayStart <= SCHEDULE_END_HOUR_ET * 60
+  );
 }
 
 function getSchedulerIntervalMs(config) {
   // Supports either config.scheduler.intervalHours or config.schedulerIntervalHours.
-  const raw = config?.scheduler?.intervalHours ?? config?.schedulerIntervalHours ?? 3;
+  const raw =
+    config?.scheduler?.intervalHours ??
+    config?.schedulerIntervalHours ??
+    DEFAULT_SCHEDULER_INTERVAL_HOURS;
   const hours = Number(raw);
   if (!Number.isFinite(hours) || hours <= 0) {
-    return 3 * 60 * 60 * 1000;
+    return DEFAULT_SCHEDULER_INTERVAL_HOURS * 60 * 60 * 1000;
   }
   return Math.max(Math.round(hours * 60 * 60 * 1000), 60000);
 }
 
 function nextScheduledRun(intervalMs) {
-  // Returns ms until the next valid clock-aligned slot in the ET weekday window.
-  const now = new Date();
-  const etStr = now.toLocaleString("en-US", { timeZone: "America/New_York" });
-  const et = new Date(etStr);
-  const day = et.getDay();
+  // Returns ms until the next valid clock-aligned slot in the ET daily window.
+  const et = getEtDate();
   const hour = et.getHours();
   const minute = et.getMinutes();
   const second = et.getSeconds();
   const millisecond = et.getMilliseconds();
-  const isWeekday = day >= 1 && day <= 5;
-  const isWithinWindow = isWeekday && hour >= 9 && hour < 20;
-  
-  // If within schedule, wait until the next aligned slot.
+  const minutesSinceDayStart = hour * 60 + minute;
+  const windowStartMinutes = SCHEDULE_START_HOUR_ET * 60;
+  const windowEndMinutes = SCHEDULE_END_HOUR_ET * 60;
+  const isWithinWindow =
+    minutesSinceDayStart >= windowStartMinutes &&
+    minutesSinceDayStart <= windowEndMinutes;
+
   if (isWithinWindow) {
     const intervalMinutes = Math.max(Math.round(intervalMs / 60000), 1);
-    const minutesSinceWindowStart = (hour - 9) * 60 + minute;
+    const minutesSinceWindowStart = minutesSinceDayStart - windowStartMinutes;
     const remainder = minutesSinceWindowStart % intervalMinutes;
     const minutesToNextSlot = remainder === 0 ? intervalMinutes : intervalMinutes - remainder;
     const nextSlotMinutesSinceWindowStart = minutesSinceWindowStart + minutesToNextSlot;
+    const scheduleWindowMinutes = windowEndMinutes - windowStartMinutes;
 
-    // Keep checks inside the 9am-8pm ET window. Anything landing at or after 8pm rolls to next weekday 9am.
-    if (nextSlotMinutesSinceWindowStart < 11 * 60) {
+    // Include the 9pm ET final slot, then roll to tomorrow 9am.
+    if (nextSlotMinutesSinceWindowStart <= scheduleWindowMinutes) {
       const waitMs = minutesToNextSlot * 60000 - second * 1000 - millisecond;
       return Math.max(waitMs, 5000);
     }
   }
-  
-  // Calculate time until next weekday 9am ET
-  let daysUntil;
-  if (day === 6) daysUntil = 2; // Sat -> Mon
-  else if (day === 0) daysUntil = 1; // Sun -> Mon
-  else if (isWithinWindow) daysUntil = (day === 5) ? 3 : 1; // No remaining slot today
-  else if (hour >= 20) daysUntil = (day === 5) ? 3 : 1; // After 8pm, next weekday
-  else daysUntil = 0; // Before 9am today
-  
+
+  const daysUntil = isWithinWindow || minutesSinceDayStart > windowEndMinutes ? 1 : 0;
   const next = new Date(et);
   next.setDate(next.getDate() + daysUntil);
-  next.setHours(9, 0, 0, 0);
+  next.setHours(SCHEDULE_START_HOUR_ET, 0, 0, 0);
   return Math.max(next.getTime() - et.getTime(), 60000);
 }
 
-async function scheduledCheck(config) {
+function scheduledSlotsLabel(config, intervalMs) {
+  const intervalMinutes = Math.max(Math.round(intervalMs / 60000), 1);
+  const slots = [];
+  for (
+    let minutes = SCHEDULE_START_HOUR_ET * 60;
+    minutes <= SCHEDULE_END_HOUR_ET * 60;
+    minutes += intervalMinutes
+  ) {
+    const hour = Math.floor(minutes / 60);
+    const suffix = hour >= 12 ? "pm" : "am";
+    const hour12 = ((hour + 11) % 12) + 1;
+    slots.push(`${hour12}${suffix}`);
+  }
+  return slots.join(", ");
+}
+
+function schedulerAllowsAutoReauth(config) {
+  return config?.scheduler?.autoReauth !== false;
+}
+
+async function scheduledCheck(config, options = {}) {
+  const autoReauth = options.autoReauth ?? true;
   // Smart check: try API first, login only if needed
   const etStr = new Date().toLocaleString("en-US", { timeZone: "America/New_York" });
   console.log(`\n⏰ Scheduled check at ${etStr} ET\n`);
   
-  const hasAuth = fs.existsSync(authFile);
-  if (!hasAuth) {
-    console.log("No auth state found, performing login...");
-    await login(config);
-  }
-  
   try {
+    const pendingReauth = activeReauthRequired();
+    if (pendingReauth && !autoReauth) {
+      const message = "Scheduled check skipped: USCIS session is expired. Run manual reauth to resume monitoring.";
+      console.error(`❌ ${message}`);
+      await notifyReauthRequired(config, pendingReauth, message);
+      return;
+    }
+
+    const hasAuth = fs.existsSync(authFile);
+    if (!hasAuth) {
+      if (autoReauth) {
+        console.log("No auth state found, performing login...");
+        await login(config);
+      } else {
+        const error = new Error("No auth state found. Manual reauth required.");
+        error.code = "SESSION_EXPIRED";
+        throw error;
+      }
+    }
+
     // Try fetching with existing token
-    await checkAllCases(config);
+    await checkAllCases(config, {
+      notifyNoChange: true,
+      autoReauth,
+    });
   } catch (error) {
     if (error.code === "SESSION_EXPIRED" || error.message?.includes("SESSION_EXPIRED")) {
-      // checkAllCases already retries once with auto-reauth
-      // If we're here, the retry also failed
-      console.error("❌ Failed even after re-authentication");
-      const webhookUrl = config?.discordWebhookUrl || process.env.PHONEMONITOR_DISCORD_WEBHOOK_URL;
-      if (webhookUrl) {
-        await sendDiscordWebhook(webhookUrl, {
-          content: `❌ \`${new Date().toISOString().replace("T", " ").slice(0, 19)} UTC\` Scheduled check failed: ${error.message}`,
-        }).catch(() => {});
-      }
+      const message = autoReauth
+        ? `Scheduled check failed after re-authentication: ${error.message}`
+        : "Scheduled check skipped: USCIS session expired. Run manual reauth before the next scheduled slot.";
+      console.error(`❌ ${message}`);
+      const state = markReauthRequired(error.message);
+      await notifyReauthRequired(config, state, message);
     } else {
       throw error;
     }
@@ -1192,6 +1898,7 @@ async function scheduledCheck(config) {
 }
 
 async function runScheduler(config) {
+  acquireSchedulerLock();
   const intervalMs = getSchedulerIntervalMs(config);
   const intervalHours = Number((intervalMs / (60 * 60 * 1000)).toFixed(2));
   const intervalLabel = Number.isInteger(intervalHours)
@@ -1199,15 +1906,27 @@ async function runScheduler(config) {
     : `${intervalHours} hours`;
 
   console.log("🕐 USCIS Case Monitor Scheduler started");
-  console.log(`   Schedule: Weekdays 9am–8pm ET, every ${intervalLabel}`);
+  console.log(`   Schedule: Daily 9am–9pm ET, every ${intervalLabel}`);
+  console.log(`   Slots: ${scheduledSlotsLabel(config, intervalMs)}`);
+  console.log(`   Auto reauth: ${schedulerAllowsAutoReauth(config) ? "enabled" : "disabled"}`);
   console.log("   Press Ctrl+C to stop\n");
   
   const run = async () => {
-    if (isWithinSchedule()) {
+    if (isWithinScheduleWindow()) {
       try {
-        await scheduledCheck(config);
+        await scheduledCheck(config, {
+          autoReauth: schedulerAllowsAutoReauth(config),
+        });
       } catch (error) {
         console.error(`❌ Scheduled check error: ${error.message}`);
+        const webhookUrl = discordWebhookUrl(config);
+        if (webhookUrl) {
+          await notifyDiscord(webhookUrl, {
+            content: `❌ \`${new Date().toISOString().replace("T", " ").slice(0, 19)} UTC\` Scheduled check crashed during login/navigation: ${error.message.split("\n")[0]}`,
+          }).catch((notifyError) => {
+            console.error(`Discord notify failed: ${notifyError.message}`);
+          });
+        }
       }
     } else {
       const etStr = new Date().toLocaleString("en-US", { timeZone: "America/New_York" });
@@ -1249,7 +1968,7 @@ async function main() {
     return;
   }
   if (command === "otp-test") {
-    const code = await readOtpFromEmail(config.otp);
+    const code = await readOtpFromConfiguredSource(config.otp);
     console.log(code);
     return;
   }
