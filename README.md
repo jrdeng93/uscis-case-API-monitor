@@ -4,6 +4,8 @@
 
 Automated USCIS case status monitor that checks your immigration cases periodically via the USCIS API and notifies you via Discord when something changes. Currently supports IOE receipt numbers.
 
+Dobby is free.
+
 ## Features
 
 - **Multi-case monitoring** — track multiple receipt numbers simultaneously
