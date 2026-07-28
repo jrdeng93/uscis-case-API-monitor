@@ -103,7 +103,26 @@ Reads OTP codes directly from the macOS Messages database. Requires Full Disk Ac
 }
 ```
 
-### Discord Notifications
+### Notifications
+
+The monitor supports **macOS Notification Center** and **Discord webhooks**. You can use one or both.
+
+#### macOS Notifications (recommended for personal use)
+
+Add to your config:
+```json
+{
+  "notificationMode": "macos"
+}
+```
+
+Or leave it unset - it auto-detects macOS and uses native notifications if no Discord webhook is configured.
+
+- **No changes**: shows "✓ USCIS Monitor - Checked N cases — no changes found"
+- **Changes detected**: shows "🔄 USCIS Case Update" with receipt number and changed fields
+- **Errors**: shows "⚠️ USCIS Monitor Error/Warning" with error details
+
+#### Discord Notifications
 
 Set `discordWebhookUrl` in config, or use the environment variable:
 
@@ -111,8 +130,26 @@ Set `discordWebhookUrl` in config, or use the environment variable:
 export USCIS_MONITOR_DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
 ```
 
+```json
+{
+  "notificationMode": "discord",
+  "discordWebhookUrl": "https://discord.com/api/webhooks/..."
+}
+```
+
 - **No changes**: sends a simple timestamp + "no changes found"
 - **Changes detected**: sends a rich embed with receipt number, API group, changed fields, and new events
+
+#### Both Modes
+
+```json
+{
+  "notificationMode": "both",
+  "discordWebhookUrl": "https://discord.com/api/webhooks/..."
+}
+```
+
+This will send notifications to both macOS Notification Center and Discord.
 
 ### How To Read Update Alerts
 

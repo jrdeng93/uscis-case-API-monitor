@@ -2,6 +2,7 @@
   "uscisEmail": "you@example.com",
   "uscisUsername": "you@example.com",
   "uscisPassword": "your-uscis-password",
+  "notificationMode": "macos",
   "receiptNumbers": [
     "IOE0000000000",
     "IOE0000000001"

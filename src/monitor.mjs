@@ -123,6 +123,58 @@ function discordWebhookUrl(config) {
   );
 }
 
+function notificationMode(config) {
+  // Supports: "discord", "macos", "both", or null/undefined (auto-detect)
+  const mode = config?.notificationMode || process.env.USCIS_MONITOR_NOTIFICATION_MODE;
+  if (mode) {
+    return mode.toLowerCase();
+  }
+  // Auto-detect: if on macOS and no Discord URL, default to macOS
+  if (process.platform === "darwin" && !discordWebhookUrl(config)) {
+    return "macos";
+  }
+  // Otherwise default to discord if URL is set
+  return discordWebhookUrl(config) ? "discord" : null;
+}
+
+async function sendMacOsNotification(title, message, subtitle = null) {
+  if (process.platform !== "darwin") {
+    console.warn("macOS notifications only available on macOS");
+    return false;
+  }
+
+  try {
+    const subtitleArg = subtitle ? ` subtitle "${subtitle.replace(/"/g, '\\"')}"` : "";
+    const script = `display notification "${message.replace(/"/g, '\\"')}" with title "${title.replace(/"/g, '\\"')}"${subtitleArg}`;
+
+    await new Promise((resolve, reject) => {
+      const child = spawn("osascript", ["-e", script], {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+
+      let stderr = "";
+      child.stderr.on("data", (chunk) => {
+        stderr += chunk.toString();
+      });
+
+      child.on("close", (code) => {
+        if (code !== 0) {
+          reject(new Error(`osascript failed: ${stderr}`));
+        } else {
+          resolve();
+        }
+      });
+
+      child.on("error", reject);
+    });
+
+    return true;
+  } catch (error) {
+    console.error(`macOS notification failed: ${error.message}`);
+    return false;
+  }
+}
+
 function authMtimeMs() {
   try {
     return fs.statSync(authFile).mtimeMs;
@@ -1486,18 +1538,46 @@ async function triggerNotification(receiptNumber, caseData, changes, config) {
   try {
     console.log(`\n🔔 [NOTIFICATION] Case ${receiptNumber} updated:`);
     console.log(`  Changes: ${JSON.stringify(changes)}`);
-    
-    const webhookUrl = discordWebhookUrl(config);
-    if (!webhookUrl) {
-      console.log("  ⚠️ No Discord webhook URL configured (set discordWebhookUrl in config or USCIS_MONITOR_DISCORD_WEBHOOK_URL env var)");
-      return;
+
+    const mode = notificationMode(config);
+    const data = caseData.data || {};
+    const formName = data.formName || receiptNumber;
+    const changedFields = Object.keys(changes).join(", ");
+
+    let notificationSent = false;
+
+    // macOS notification
+    if (mode === "macos" || mode === "both") {
+      const title = `🔄 USCIS Case Update`;
+      const subtitle = formName;
+      const message = `Receipt: ${receiptNumber}\nChanged: ${changedFields}`;
+      const sent = await sendMacOsNotification(title, message, subtitle);
+      if (sent) {
+        console.log("  ✓ macOS notification sent");
+        notificationSent = true;
+      }
     }
-    
-    const payload = buildDiscordEmbed(receiptNumber, caseData, changes);
-    const sent = await notifyDiscord(webhookUrl, payload);
-    console.log(sent ? "  ✓ Discord notification sent" : "  ⚠️ Discord notification queued for retry");
+
+    // Discord notification
+    if (mode === "discord" || mode === "both") {
+      const webhookUrl = discordWebhookUrl(config);
+      if (!webhookUrl) {
+        console.log("  ⚠️ No Discord webhook URL configured (set discordWebhookUrl in config or USCIS_MONITOR_DISCORD_WEBHOOK_URL env var)");
+      } else {
+        const payload = buildDiscordEmbed(receiptNumber, caseData, changes);
+        const sent = await notifyDiscord(webhookUrl, payload);
+        console.log(sent ? "  ✓ Discord notification sent" : "  ⚠️ Discord notification queued for retry");
+        if (sent) {
+          notificationSent = true;
+        }
+      }
+    }
+
+    if (!notificationSent && !mode) {
+      console.log("  ⚠️ No notification method configured. Add notificationMode: \"macos\" to config or set discordWebhookUrl");
+    }
   } catch (error) {
-    console.error(`  ✗ Discord notification failed: ${error.message}`);
+    console.error(`  ✗ Notification failed: ${error.message}`);
   }
 }
 
@@ -1575,9 +1655,13 @@ async function checkAllCases(config, options = {}) {
           
           if (isChanged) {
             console.log(`  Changes: ${Object.keys(changes).join(", ")}`);
-            
-            // Trigger notification
-            await triggerNotification(receiptNumber, caseData, changes, config);
+
+            // Trigger notification only if we have valid case data
+            if (caseData && caseData.data) {
+              await triggerNotification(receiptNumber, caseData, changes, config);
+            } else {
+              console.log(`  ⚠️  Skipping notification: invalid case data`);
+            }
           }
           
           console.log();
@@ -1604,14 +1688,15 @@ async function checkAllCases(config, options = {}) {
           if (error.code === "NETWORK_ERROR") {
             console.error(`❌ Network error fetching ${receiptNumber}: ${error.message}\n`);
           } else {
-            console.error(`❌ Error processing ${receiptNumber}: ${error.message}\n`);
+            console.error(`❌ Error processing ${receiptNumber}: ${error.message}`);
+            console.error(`   Stack: ${error.stack}\n`);
           }
           results.push({
             receiptNumber,
             isChanged: false,
             formName: null,
             updatedAt: null,
-            error: error.message,
+            error: String(error.message || error),
           });
         }
       }
@@ -1635,47 +1720,74 @@ async function checkAllCases(config, options = {}) {
       console.log("📊 Summary:");
       console.log(JSON.stringify(summary, null, 2));
       
-      // Send Discord summary
+      // Send summary notifications
+      const mode = notificationMode(config);
       const webhookUrl = discordWebhookUrl(config);
-      if (webhookUrl) {
-        const tsUtc = checkedAtDate.toISOString().replace("T", " ").slice(0, 19) + " UTC";
-        const tsEt = formatEtTimestamp(checkedAtDate);
-        const errorResults = summary.results.filter(r => r.error);
-        const successResults = summary.results.filter(r => !r.error);
-        const warningResults = summary.results.filter(r => r.apiErrors && Object.keys(r.apiErrors).length > 0);
+      const tsUtc = checkedAtDate.toISOString().replace("T", " ").slice(0, 19) + " UTC";
+      const tsEt = formatEtTimestamp(checkedAtDate);
+      const errorResults = summary.results.filter(r => r.error);
+      const successResults = summary.results.filter(r => !r.error);
+      const warningResults = summary.results.filter(r => r.apiErrors && Object.keys(r.apiErrors).length > 0);
 
-        if (notifyErrors && errorResults.length === summary.totalCases) {
-          // All cases failed — send error alert
-          const firstError = errorResults[0]?.error || "Unknown error";
-          await notifyDiscord(webhookUrl, {
-            content: `⚠️ \`${tsEt}\` (${tsUtc}) All ${summary.totalCases} case checks failed — \`${firstError}\`. Will retry next cycle.`,
-          }).catch((e) => console.error(`Discord notify failed: ${e.message}`));
-        } else if (notifyErrors && errorResults.length > 0) {
-          // Partial failure
-          const failed = errorResults.map(r => r.receiptNumber).join(", ");
-          await notifyDiscord(webhookUrl, {
-            content: `⚠️ \`${tsEt}\` (${tsUtc}) Checked ${summary.totalCases} cases — ${successResults.length} OK, ${errorResults.length} failed (${failed}). Will retry next cycle.`,
-          }).catch((e) => console.error(`Discord notify failed: ${e.message}`));
-        } else if (notifyErrors && warningResults.length > 0 && summary.changedCases === 0) {
-          const warningSummary = warningResults
-            .map((result) => {
-              const apiNames = Object.keys(result.apiErrors || {}).join(", ");
-              return `${result.receiptNumber}: ${apiNames}`;
-            })
-            .join("; ");
-          await notifyDiscord(webhookUrl, {
-            content: `⚠️ \`${tsEt}\` (${tsUtc}) Checked ${summary.totalCases} cases — data stable, but auxiliary API warning(s): ${warningSummary}. Previous successful values were preserved.`,
-          }).catch((e) => console.error(`Discord notify failed: ${e.message}`));
-        } else if (summary.changedCases === 0 && notifyNoChange) {
-          // All success, no changes
-          await notifyDiscord(webhookUrl, {
-            content: `\`${tsEt}\` (${tsUtc}) ✓ Checked ${summary.totalCases} cases — no changes found.`,
-          }).catch((e) => console.error(`Discord notify failed: ${e.message}`));
-        } else if (summary.changedCases === 0) {
-          console.log("Discord no-change summary suppressed for this scheduled keepalive.");
+      if (notifyErrors && errorResults.length === summary.totalCases) {
+        // All cases failed — send error alert
+        const firstError = errorResults[0]?.error || "Unknown error";
+        const message = `All ${summary.totalCases} case checks failed — ${firstError}. Will retry next cycle.`;
+
+        if (mode === "macos" || mode === "both") {
+          await sendMacOsNotification("⚠️ USCIS Monitor Error", message, tsEt);
         }
-        // If changedCases > 0, individual notifications already sent via triggerNotification()
+        if ((mode === "discord" || mode === "both") && webhookUrl) {
+          await notifyDiscord(webhookUrl, {
+            content: `⚠️ \`${tsEt}\` (${tsUtc}) ${message}`,
+          }).catch((e) => console.error(`Discord notify failed: ${e.message}`));
+        }
+      } else if (notifyErrors && errorResults.length > 0) {
+        // Partial failure
+        const failed = errorResults.map(r => r.receiptNumber).join(", ");
+        const message = `Checked ${summary.totalCases} cases — ${successResults.length} OK, ${errorResults.length} failed (${failed}). Will retry next cycle.`;
+
+        if (mode === "macos" || mode === "both") {
+          await sendMacOsNotification("⚠️ USCIS Monitor Warning", message, tsEt);
+        }
+        if ((mode === "discord" || mode === "both") && webhookUrl) {
+          await notifyDiscord(webhookUrl, {
+            content: `⚠️ \`${tsEt}\` (${tsUtc}) ${message}`,
+          }).catch((e) => console.error(`Discord notify failed: ${e.message}`));
+        }
+      } else if (notifyErrors && warningResults.length > 0 && summary.changedCases === 0) {
+        const warningSummary = warningResults
+          .map((result) => {
+            const apiNames = Object.keys(result.apiErrors || {}).join(", ");
+            return `${result.receiptNumber}: ${apiNames}`;
+          })
+          .join("; ");
+        const message = `Checked ${summary.totalCases} cases — data stable, but auxiliary API warning(s): ${warningSummary}. Previous successful values were preserved.`;
+
+        if (mode === "macos" || mode === "both") {
+          await sendMacOsNotification("⚠️ USCIS Monitor Warning", message, tsEt);
+        }
+        if ((mode === "discord" || mode === "both") && webhookUrl) {
+          await notifyDiscord(webhookUrl, {
+            content: `⚠️ \`${tsEt}\` (${tsUtc}) ${message}`,
+          }).catch((e) => console.error(`Discord notify failed: ${e.message}`));
+        }
+      } else if (summary.changedCases === 0 && notifyNoChange) {
+        // All success, no changes
+        const message = `Checked ${summary.totalCases} cases — no changes found.`;
+
+        if (mode === "macos" || mode === "both") {
+          await sendMacOsNotification("✓ USCIS Monitor", message, tsEt);
+        }
+        if ((mode === "discord" || mode === "both") && webhookUrl) {
+          await notifyDiscord(webhookUrl, {
+            content: `\`${tsEt}\` (${tsUtc}) ✓ ${message}`,
+          }).catch((e) => console.error(`Discord notify failed: ${e.message}`));
+        }
+      } else if (summary.changedCases === 0) {
+        console.log("No-change summary suppressed for this scheduled keepalive.");
       }
+      // If changedCases > 0, individual notifications already sent via triggerNotification()
       
       return summary; // Success, exit loop
       
